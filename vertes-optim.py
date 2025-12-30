@@ -5,7 +5,6 @@ import math
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
-from collections import Counter
 from pathlib import Path
 from utils import plot_data
 
@@ -16,7 +15,6 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 SEED = 42
 generator = np.random.Generator(np.random.MT19937(SEED))
 
-type Neuron = tuple[float, float]
 
 def draw_graph(graph, file_path: Path | None = None):
     # Setup figure
@@ -104,58 +102,92 @@ def init_all(N, alpha: float):
 
     return graph, probs
 
+
 def run_simulation(alpha: float, N=100, rho: float = 0.1) -> tuple[np.ndarray, np.ndarray]:
     """
-    Run Vértes improved spatial network algorithm.
+    Run Vértes improved spatial network algorithm (Vértes et al. 2012 PNAS).
+
+    Algorithm:
+    1. Place N nodes randomly in [0,1]^2
+    2. Compute P(i,j) ∝ exp(-α * d_ij), normalized so Σ P = 1
+    3. Iteratively sample edges according to P until target density ρ is reached
+    4. Multiple selections of same edge → weight (connection strength)
 
     Returns:
-        tuple: (weight_matrix NxN, positions Nx2 array)
+        tuple: (weight_matrix NxN directed, positions Nx2 array)
     """
-    graph, probs = init_all(N, alpha)
+    # Vectorized position generation
+    # 1. Generate positions - all N nodes placed at start
+    positions = np.column_stack([
+        generator.uniform(0, 1, N),
+        generator.uniform(0, 1, N)
+    ])
 
-    target_edges = math.ceil(rho * N * (N - 1))
+    # Vectorized distance computation
+    # 2. Compute pairwise Euclidean distances
+    diff_x = positions[:, 0:1] - positions[:, 0:1].T
+    diff_y = positions[:, 1:2] - positions[:, 1:2].T
+    distances = np.sqrt(diff_x**2 + diff_y**2)
 
-    # Extract positions for return
-    positions = np.array([graph.nodes[i]['pos'] for i in range(N)])
+    # 3. Compute probability matrix: P(i,j) ∝ exp(-α * d_ij)
+    probs = np.exp(-alpha * distances)
+    np.fill_diagonal(probs, 0)
 
-    # Prepare probabilities
-    flat_probs = probs.ravel().copy()
-    sum_p = flat_probs.sum()
-    if sum_p == 0:
+    # Normalize so Σ P = 1
+    total_sum = probs.sum()
+    if total_sum == 0:
         return np.zeros((N, N), dtype=int), positions
+    probs = probs / total_sum
 
-    flat_probs /= sum_p
+    # 4. Target: number of UNIQUE edges = density × max possible directed edges
+    # For directed graph without self-loops: max = N(N-1)
+    target_unique_edges = math.ceil(rho * N * (N - 1))
 
-    edge_selection_counts = Counter()
-    while graph.number_of_edges() < target_edges:
+    # Flatten probability matrix for sampling
+    flat_probs = probs.ravel()
+
+    # Weight matrix tracks how many times each edge was selected
+    weight_matrix = np.zeros((N, N), dtype=int)
+    num_unique_edges = 0
+
+    # Batch sampling - sample multiple edges per iteration
+    batch_size = 100
+
+    # Iteratively sample edges until we reach target unique edges
+    while num_unique_edges < target_unique_edges:
+        # Sample batch of edge indices according to probability distribution
         sampled_indices = generator.choice(
             len(flat_probs),
-            size=100,
+            size=batch_size,
             replace=True,
             p=flat_probs
         )
 
+        # Process each sampled edge
         for idx in sampled_indices:
+            # Convert flat index to (i, j) coordinates
             n1, n2 = divmod(idx, N)
+
+            # Skip self-loops
             if n1 == n2:
                 continue
 
-            edge_selection_counts[idx] += 1
+            # Check if this is a new unique edge
+            is_new_edge = (weight_matrix[n1, n2] == 0)
 
-            # Graph Update
-            is_new = not graph.has_edge(n1, n2)
+            # Increment edge weight (selection count)
+            # Direct array increment instead of graph[n1][n2]['weight'] = ...
+            weight_matrix[n1, n2] += 1
 
-            if is_new:
-                if graph.number_of_edges() < target_edges:
-                    graph.add_edge(n1, n2, weight=edge_selection_counts[idx])
-                else:
+            # Track unique edges
+            if is_new_edge:
+                num_unique_edges += 1
+                # Stop when we reach target
+                if num_unique_edges >= target_unique_edges:
                     break
-            else:
-                graph[n1][n2]['weight'] = edge_selection_counts[idx]
 
-    # Return adjacency matrix
-    adj_matrix = nx.to_numpy_array(graph, nodelist=range(N), weight='weight').astype(int)
-    return adj_matrix, positions
+
+    return weight_matrix, positions
 
 
 # Helper to convert back to graph for plotting
